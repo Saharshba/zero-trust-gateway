@@ -1,0 +1,13 @@
+line-length = 120
+target-version = "py312"
+
+[lint]
+select = ["E", "F", "I", "B", "UP", "C4"]
+ignore = [
+    "B008",    # FastAPI's Depends() in a default argument is the documented idiom
+    "UP017",   # timezone.utc reads more explicitly than datetime.UTC
+    "UP042",   # str + Enum, not StrEnum: SQLAlchemy stores the .value either way
+]
+
+[lint.per-file-ignores]
+"tests/*" = ["E402"]  # conftest sets the environment before importing zta
