@@ -1,0 +1,135 @@
+# Zero-Trust Network Access Gateway
+#
+#   cp .env.example .env   &&   docker compose up --build
+#
+# Network layout is the point of this file:
+#   edge      - TLS terminator and the gateway. Published to the host.
+#   internal  - the three protected services. No published ports, and not
+#               reachable from `edge` except through the gateway.
+#   data      - postgres and redis. Reachable only by the control plane.
+#
+# The internal services have no authentication of their own; they are
+# protected by network placement *and* by verifying the gateway's HMAC.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-zta}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-zta_password}
+      POSTGRES_DB: ${POSTGRES_DB:-zta}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-zta} -d ${POSTGRES_DB:-zta}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks: [data]
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks: [data]
+
+  control-plane:
+    build: ./backend
+    env_file: [.env]
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://zta:zta_password@postgres:5432/zta}
+      REDIS_URL: redis://redis:6379/0
+    command: ["uvicorn", "zta.control_plane.app:app", "--host", "0.0.0.0", "--port", "8000"]
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    ports:
+      - "8000:8000"      # admin API + dashboard backend
+    networks: [edge, data]
+    restart: unless-stopped
+
+  gateway:
+    build: ./backend
+    env_file: [.env]
+    environment:
+      CONTROL_PLANE_URL: http://control-plane:8000
+      REDIS_ENABLED: "false"
+    command: ["uvicorn", "zta.gateway.app:app", "--host", "0.0.0.0", "--port", "8080"]
+    depends_on:
+      control-plane: {condition: service_started}
+    ports:
+      - "8080:8080"
+    networks: [edge, internal]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+
+  internal-public:
+    build: ./backend
+    env_file: [.env]
+    environment: {SERVICE_NAME: public, SERVICE_PORT: "9001"}
+    command: ["uvicorn", "zta.services.internal_service:app", "--host", "0.0.0.0", "--port", "9001"]
+    networks: [internal]          # no ports: reachable only through the gateway
+    restart: unless-stopped
+
+  internal-reports:
+    build: ./backend
+    env_file: [.env]
+    environment: {SERVICE_NAME: reports, SERVICE_PORT: "9002"}
+    command: ["uvicorn", "zta.services.internal_service:app", "--host", "0.0.0.0", "--port", "9002"]
+    networks: [internal]
+    restart: unless-stopped
+
+  internal-admin:
+    build: ./backend
+    env_file: [.env]
+    environment: {SERVICE_NAME: admin, SERVICE_PORT: "9003"}
+    command: ["uvicorn", "zta.services.internal_service:app", "--host", "0.0.0.0", "--port", "9003"]
+    networks: [internal]
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:8000}
+        VITE_GATEWAY_URL: ${VITE_GATEWAY_URL:-http://localhost:8080}
+    depends_on: [control-plane]
+    ports:
+      - "5173:80"
+    networks: [edge]
+    restart: unless-stopped
+
+  # TLS terminator in front of the gateway. Generate the certificate first:
+  #   ./nginx/generate-cert.sh
+  # then start it with:  docker compose --profile tls up -d tls-proxy
+  tls-proxy:
+    image: nginx:1.27-alpine
+    profiles: [tls]
+    volumes:
+      - ./nginx/gateway-tls.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./nginx/certs:/etc/nginx/certs:ro
+    ports:
+      - "8443:8443"
+    depends_on: [gateway]
+    networks: [edge]
+
+volumes:
+  pgdata:
+
+networks:
+  edge:
+    driver: bridge
+  internal:
+    driver: bridge
+    internal: true      # no route to the outside world at all
+  data:
+    driver: bridge
+    internal: true
